@@ -65,10 +65,11 @@ from vllm_ascend.attention.attention_c8_mxfp import (
     mxfp_cache_spec,
     mxfp_cache_views_for_spec,
 )
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.dsa_v41 import AscendDSAV41MetadataBuilder, DeepseekV41CacheBackend
+from vllm_ascend.attention.fa_v1 import AscendFlashAttentionBackend
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -153,6 +154,56 @@ def ring_state_update_skipped() -> bool:
     return _SKIP_RING_STATE_UPDATE.get()
 
 
+def _try_pack_draft_window_pages(
+    specs: dict[str, KVCacheSpec], layers: Mapping[str, AttentionLayerBase], state_page_bytes: int
+) -> bool:
+    """Pack whole draft blocks into the target page using the combined K/V view."""
+    targets = [s for s in specs.values() if type(s) is FullAttentionSpec and not s.is_draft]
+    drafts = {name: s for name, s in specs.items() if type(s) is SlidingWindowSpec and s.is_draft}
+    if not targets or not drafts or len(targets) + len(drafts) != len(specs):
+        return False
+    target = targets[0]
+    page = target.real_page_size_bytes
+    if (
+        state_page_bytes > page
+        or any(s != target for s in targets)
+        or all(page % s.real_page_size_bytes == 0 for s in drafts.values())
+    ):
+        return False
+    updates = {}
+    for name, spec in specs.items():
+        backend = layers[name].get_attn_backend()
+        if (
+            backend not in (AscendAttentionBackend, AscendFlashAttentionBackend)
+            or spec.head_size != spec.head_size_v
+            or spec.page_size_bytes > page
+            or spec.kv_quant_mode != KVQuantMode.NONE
+        ):
+            return False
+        if name not in drafts:
+            continue
+        if backend.get_supported_kernel_block_sizes() != [spec.block_size]:
+            return False
+        # A draft block must end on every target checkpoint, and each kernel
+        # slot must have an integral stride in cache elements.
+        if target.block_size % spec.block_size:
+            return False
+        max_blocks = min(page // spec.real_page_size_bytes, target.block_size // spec.block_size)
+        for count in range(max_blocks, 0, -1):
+            tokens = count * spec.block_size
+            if target.block_size % tokens == 0 and page % (count * get_dtype_size(spec.dtype)) == 0:
+                break
+        else:
+            return False
+        # A single unexpanded draft block can lose capacity to sliding-window
+        # rounding even with a smaller physical page. Keep the LCM fallback.
+        if count == 1:
+            return False
+        updates[name] = replace(spec, block_size=tokens, page_size_padded=page)
+    specs.update(updates)
+    return True
+
+
 def _align_hybrid_attention_page_sizes(kv_cache_specs: dict[str, KVCacheSpec], minimum_page_size: int = 0) -> None:
     """Align dense K/V segments before padding a shared Attention/Mamba pool."""
     if any(isinstance(spec, AscendSFAIndexerCacheSpec) for spec in kv_cache_specs.values()):
@@ -168,7 +219,10 @@ def _align_hybrid_attention_page_sizes(kv_cache_specs: dict[str, KVCacheSpec], m
     if not attention_specs:
         return
     reference = max(attention_specs.values(), key=lambda spec: spec.real_page_size_bytes)
-    page_size = reference.real_page_size_bytes
+    # Use the smallest page that can be formed by growing every scheduler
+    # block by an integer factor. The largest page alone is insufficient
+    # when attention layers have non-divisible unpadded page sizes.
+    page_size = math.lcm(*(spec.real_page_size_bytes for spec in attention_specs.values()))
     for layer_name, spec in attention_specs.items():
         # Ascend packs each layer as [all K blocks][all V blocks]. Equal
         # padded pages alone do not isolate block IDs: a smaller SWA K segment
@@ -277,7 +331,16 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                     kv_cache_spec[layer_name] = replace(spec, page_size_padded=mamba_page_size)
             kv_cache_spec.update(mamba_specs)
         else:
-            _align_hybrid_attention_page_sizes(kv_cache_spec)
+            can_pack = (
+                vllm_config.kv_transfer_config is None
+                and vllm_config.parallel_config.decode_context_parallel_size == 1
+                and getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1) == 1
+                and _try_pack_draft_window_pages(
+                    kv_cache_spec, attn_layers, max(spec.page_size_bytes for spec in mamba_specs.values())
+                )
+            )
+            if not can_pack:
+                _align_hybrid_attention_page_sizes(kv_cache_spec)
             common_page_size = max(spec.page_size_bytes for spec in (*kv_cache_spec.values(), *mamba_specs.values()))
             for layer_name in attention_layer_names:
                 spec = kv_cache_spec[layer_name]

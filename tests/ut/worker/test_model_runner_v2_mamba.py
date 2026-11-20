@@ -1,4 +1,5 @@
 import ast
+import math
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -1079,7 +1080,7 @@ def test_mamba_spec_follows_aligned_attention_spec(
 
 @pytest.mark.parametrize("include_mamba", [False, True])
 @patch("vllm_ascend.worker.v2.attn_utils.get_layers_from_vllm_config")
-def test_get_kv_cache_spec_rejects_nondivisible_hybrid_attention_pages(
+def test_get_kv_cache_spec_aligns_nondivisible_hybrid_attention_pages(
     mock_get_layers,
     include_mamba,
 ):
@@ -1128,8 +1129,12 @@ def test_get_kv_cache_spec_rejects_nondivisible_hybrid_attention_pages(
     }
 
     if include_mamba:
-        with pytest.raises(ValueError, match="Cannot align hybrid attention K/V pages for small_attn"):
-            get_kv_cache_spec(_mock_vllm_config())
+        specs = get_kv_cache_spec(_mock_vllm_config())
+        assert specs["small_attn"].real_page_size_bytes == 240
+        assert specs["large_attn"].real_page_size_bytes == 240
+        assert specs["small_attn"].block_size == 20
+        assert specs["large_attn"].block_size == 12
+        assert specs["linear_attn"].page_size_bytes == 240
     else:
         del mock_get_layers.return_value["linear_attn"]
         # Non-hybrid allocation does not use the shared Attention/Mamba layout.
@@ -1137,15 +1142,18 @@ def test_get_kv_cache_spec_rejects_nondivisible_hybrid_attention_pages(
         assert specs == {"small_attn": small_attention_spec, "large_attn": large_attention_spec}
 
 
-@pytest.mark.parametrize("full_block_size", [128, 512])
-@pytest.mark.parametrize("draft_num_kv_heads", [1, 2])
+@pytest.mark.parametrize("full_block_size", [128, 512, 1152])
+@pytest.mark.parametrize("draft_num_kv_heads", [1, 2, 8])
 @pytest.mark.parametrize("padded_sliding", [False, True])
 def test_hybrid_dflash_writes_preserve_other_request_blocks(
     monkeypatch, full_block_size, draft_num_kv_heads, padded_sliding
 ):
     """Draft writes must not alias another block ID in target attention or GDN."""
     full = FullAttentionSpec(block_size=full_block_size, num_kv_heads=1, head_size=2, dtype=torch.bfloat16)
-    padded_page_size = full.real_page_size_bytes + 64
+    # Padding must also split into dtype-aligned kernel blocks for every layout.
+    padded_page_size = 2 * math.lcm(
+        full.real_page_size_bytes, 128 * draft_num_kv_heads * 4, full_block_size * draft_num_kv_heads * 4
+    )
     sliding = SlidingWindowSpec(
         block_size=128,
         num_kv_heads=draft_num_kv_heads,
@@ -1231,11 +1239,40 @@ def test_hybrid_dflash_writes_preserve_other_request_blocks(
                     torch.testing.assert_close(target_cache[other_blocks], expected[other_blocks])
     assert specs["draft.sliding"].sliding_window == sliding.sliding_window
     assert specs["draft.sliding"].extra_retained_tokens == sliding.extra_retained_tokens
-    assert specs["draft.sliding"].block_size == full_block_size * 2 // draft_num_kv_heads
+    common_page = math.lcm(full.real_page_size_bytes, sliding.real_page_size_bytes, draft_full.real_page_size_bytes)
+    assert specs["draft.sliding"].block_size == sliding.block_size * (common_page // sliding.real_page_size_bytes)
     assert specs["draft.full"].block_size == specs["draft.sliding"].block_size
     assert specs["draft.full"].non_causal is True
     assert specs["target.gdn"] == mamba
     assert sliding.block_size == 128
+
+
+@pytest.mark.parametrize("target_tokens, expected_draft", [(1152, 384), (1920, 640), (1024, None)])
+def test_pack_draft_window_preserves_target_boundaries(target_tokens, expected_draft):
+    target = FullAttentionSpec(block_size=target_tokens, num_kv_heads=1, head_size=8, dtype=torch.bfloat16)
+    draft = SlidingWindowSpec(
+        block_size=128, num_kv_heads=2, head_size=8, dtype=torch.bfloat16, sliding_window=2048, is_draft=True
+    )
+    specs = {"target": target, "draft": draft}
+    layers = dict.fromkeys(specs, SimpleNamespace(get_attn_backend=lambda: attn_utils.AscendFlashAttentionBackend))
+    page = target.real_page_size_bytes
+    packed = attn_utils._try_pack_draft_window_pages(specs, layers, page)
+    assert packed == (expected_draft is not None)
+    assert specs["target"] == target
+    if expected_draft is None:
+        assert specs["draft"] == draft
+        return
+    assert specs["draft"] == replace(draft, block_size=expected_draft, page_size_padded=page)
+    count = expected_draft // draft.block_size
+    raw = torch.zeros(3 * page, dtype=torch.uint8)
+    k, v = attn_utils._reshape_combined_attention_kv_cache(
+        raw, (2, 3 * count, draft.block_size, draft.num_kv_heads, draft.head_size), draft.dtype, page, count
+    )
+    k[count : 2 * count].fill_(1)
+    v[count : 2 * count].fill_(2)
+    assert (k[count : 2 * count] == 1).all()
+    assert (v[count : 2 * count] == 2).all()
+    assert not raw[:page].any() and not raw[2 * page :].any()
 
 
 def test_hybrid_attention_alignment_rejects_different_k_v_proportions():
