@@ -1230,6 +1230,34 @@ def test_hybrid_dflash_writes_preserve_other_request_blocks(
     assert sliding.block_size == 128
 
 
+@pytest.mark.parametrize("target_tokens, expected_draft", [(1152, 384), (1920, 640), (1024, None)])
+def test_pack_draft_window_preserves_target_boundaries(target_tokens, expected_draft):
+    target = FullAttentionSpec(block_size=target_tokens, num_kv_heads=1, head_size=8, dtype=torch.bfloat16)
+    draft = SlidingWindowSpec(
+        block_size=128, num_kv_heads=2, head_size=8, dtype=torch.bfloat16, sliding_window=2048, is_draft=True
+    )
+    specs = {"target": target, "draft": draft}
+    layers = dict.fromkeys(specs, SimpleNamespace(get_attn_backend=lambda: attn_utils.AscendFlashAttentionBackend))
+    page = target.real_page_size_bytes
+    packed = attn_utils._try_pack_draft_window_pages(specs, layers, page)
+    assert packed == (expected_draft is not None)
+    assert specs["target"] == target
+    if expected_draft is None:
+        assert specs["draft"] == draft
+        return
+    assert specs["draft"] == replace(draft, block_size=expected_draft, page_size_padded=page)
+    count = expected_draft // draft.block_size
+    raw = torch.zeros(3 * page, dtype=torch.uint8)
+    k, v = attn_utils._reshape_combined_attention_kv_cache(
+        raw, (2, 3 * count, draft.block_size, draft.num_kv_heads, draft.head_size), draft.dtype, page, count
+    )
+    k[count : 2 * count].fill_(1)
+    v[count : 2 * count].fill_(2)
+    assert (k[count : 2 * count] == 1).all()
+    assert (v[count : 2 * count] == 2).all()
+    assert not raw[:page].any() and not raw[2 * page :].any()
+
+
 def test_hybrid_attention_alignment_rejects_different_k_v_proportions():
     full = FullAttentionSpec(block_size=128, num_kv_heads=1, head_size=2, dtype=torch.float16)
     # Equal total page sizes still do not make the K and V segments compatible.
