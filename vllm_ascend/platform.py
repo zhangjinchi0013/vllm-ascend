@@ -475,6 +475,61 @@ class NPUPlatform(Platform):
             return int(vector_core_num)
         return 24  # safe default (24 Cube Cores)
 
+    @staticmethod
+    def _align_hybrid_dflash_block_size(vllm_config: VllmConfig) -> None:
+        cache_config = vllm_config.cache_config
+        spec_config = vllm_config.speculative_config
+        if (
+            spec_config is None
+            or spec_config.method != "dflash"
+            or not vllm_config.use_v2_model_runner
+            or vllm_config.model_config.use_mla
+            or cache_config.user_specified_block_size
+            or cache_config.cache_dtype not in ("auto", "bfloat16", "float16")
+            or cache_config.kv_cache_dtype_skip_layers
+        ):
+            return
+
+        from dataclasses import replace
+
+        from vllm.config.vllm import get_layers_from_vllm_config, set_current_vllm_config
+        from vllm.model_executor.layers.attention import Attention
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+        target_token_sizes: set[int] = set()
+        draft_page_sizes: set[int] = set()
+        with set_current_vllm_config(vllm_config):
+            for layer in get_layers_from_vllm_config(vllm_config, Attention).values():
+                spec = layer.get_kv_cache_spec(vllm_config)
+                if not layer.is_draft_layer and type(spec) is FullAttentionSpec:
+                    target_token_sizes.add(replace(spec, block_size=1).real_page_size_bytes)
+                elif layer.is_draft_layer and type(spec) is SlidingWindowSpec:
+                    kernel_sizes = layer.get_attn_backend().get_supported_kernel_block_sizes(spec)
+                    if len(kernel_sizes) != 1 or not isinstance(kernel_sizes[0], int):
+                        # A flexible draft backend can choose its own compatible block size.
+                        continue
+                    draft_page_sizes.add(replace(spec, block_size=kernel_sizes[0]).real_page_size_bytes)
+
+        # The target page must be a whole number of fixed draft pages before
+        # Attention/Mamba padding. Pass the token alignment to the upstream
+        # hybrid planner so it also refreshes the Mamba page and checkpoint sizes.
+        block_size = cache_config.block_size
+        aligned_block_size = math.lcm(
+            block_size,
+            *(
+                draft_bytes // math.gcd(draft_bytes, target_bytes)
+                for draft_bytes in draft_page_sizes
+                for target_bytes in target_token_sizes
+            ),
+        )
+        if aligned_block_size != block_size:
+            logger.info(
+                "Extending automatic hybrid KV block alignment from %d to %d tokens for DFlash draft pages.",
+                block_size,
+                aligned_block_size,
+            )
+            cache_config.block_size = aligned_block_size
+
     @classmethod
     def _align_hybrid_block_size(cls, vllm_config: VllmConfig, backend_cls) -> None:
         if (
@@ -489,6 +544,7 @@ class NPUPlatform(Platform):
             HybridAttentionMambaModelConfig.verify_and_update_config(vllm_config)
             return
 
+        cls._align_hybrid_dflash_block_size(vllm_config)
         super()._align_hybrid_block_size(vllm_config, backend_cls)
 
         if vllm_config.model_config.use_mla and vllm_config.model_config.hf_config.model_type == "kimi_k31":
